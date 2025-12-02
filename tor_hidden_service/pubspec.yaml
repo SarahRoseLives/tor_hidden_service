@@ -1,6 +1,6 @@
 name: tor_hidden_service
 description: A Flutter plugin to host Tor Onion Hidden Services and proxy traffic through Tor.
-version: 0.0.2
+version: 0.0.3
 repository: https://github.com/SarahRoseLives/tor_hidden_service
 
 environment:

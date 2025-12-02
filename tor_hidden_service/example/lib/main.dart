@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+// Ensure your TorHiddenService class is correctly defined in this file:
 import 'package:tor_hidden_service/tor_hidden_service.dart';
 
 void main() {
@@ -26,6 +27,9 @@ class _MyAppState extends State<MyApp> {
   final List<String> _logs = [];
   bool _isRunning = false;
 
+  // Variable to hold the server instance
+  HttpServer? _localServer;
+
   @override
   void initState() {
     super.initState();
@@ -45,6 +49,34 @@ class _MyAppState extends State<MyApp> {
     });
   }
 
+  // 🌟 Implementation of the local web server (Hosting logic)
+  Future<void> _startLocalServer() async {
+    // Check if the server is already running to prevent errors
+    if (_localServer != null) {
+      setState(() => _logs.add('🎯 Local server already running.'));
+      return;
+    }
+
+    try {
+      // Binds the server to the loopback address on port 8080
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 8080);
+      _localServer = server; // Store the instance
+      setState(() => _logs.add('🎯 Local server running on port 8080'));
+
+      // Listen for incoming requests and send the required response
+      server.listen((HttpRequest request) {
+        request.response
+          ..headers.contentType = ContentType.html
+          ..write('<h1>Hello from Flutter Onion!</h1>')
+          ..close();
+      });
+    } catch (e) {
+      // Log error if port 8080 is already in use
+      setState(() => _logs.add("Server check (likely already running or error): $e"));
+    }
+  }
+
+
   Future<void> _initTor() async {
     setState(() {
       _status = 'Starting...';
@@ -54,6 +86,10 @@ class _MyAppState extends State<MyApp> {
     });
 
     try {
+      // 1. Start the local server
+      await _startLocalServer();
+
+      // 2. Start the Tor process (which connects to 8080 via native code)
       await _torService.start();
 
       // Get the address
@@ -62,6 +98,7 @@ class _MyAppState extends State<MyApp> {
       setState(() {
         _status = 'Running';
         _onionUrl = hostname ?? 'Error getting hostname';
+        _logs.add("✅ Hidden Service Hostname: $_onionUrl");
       });
     } catch (e) {
       setState(() {
@@ -72,12 +109,20 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _stopTor() async {
+    // 1. Stop the local server
+    await _localServer?.close(force: true);
+    _localServer = null;
+    setState(() => _logs.add("🛑 Local server stopped."));
+
+    // 2. Stop the Tor service
     await _torService.stop();
+
     setState(() {
       _status = 'Stopped';
       _isRunning = false;
       _onionUrl = 'Not generated yet';
       _torIp = 'Unknown';
+      _logs.add("🛑 Tor service stopped.");
     });
   }
 
