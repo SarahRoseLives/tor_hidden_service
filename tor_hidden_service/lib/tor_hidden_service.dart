@@ -1,13 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data'; // Required for Uint8List
 import 'package:flutter/services.dart';
 
 class TorHiddenService {
   final _methodChannel = const MethodChannel('tor_hidden_service');
   final _eventChannel = const EventChannel('tor_hidden_service/logs');
-
-  // The local port where Tor exposes its HTTP/SOCKS proxy
   static const int _torHttpProxyPort = 9080;
 
   Stream<String> get onLog {
@@ -30,8 +29,6 @@ class TorHiddenService {
     }
   }
 
-  /// Returns a standard HttpClient configured to use the Tor proxy.
-  /// Useful for HTTPS requests or binary streams where you want standard Dart handling.
   HttpClient getSecureTorClient() {
     final client = HttpClient();
     client.findProxy = (uri) => "PROXY localhost:$_torHttpProxyPort";
@@ -40,17 +37,11 @@ class TorHiddenService {
     return client;
   }
 
-  /// Returns a robust client specifically designed for unsecure (HTTP) .onion addresses.
-  /// It manually handles the connection to ensure full response buffering.
   TorOnionClient getUnsecureTorClient() {
     return TorOnionClient(proxyPort: _torHttpProxyPort);
   }
 }
 
-/// A custom HTTP Client that tunnels plain HTTP through the Tor Proxy.
-///
-/// It buffers the entire response to prevent "Unexpected end of input" errors
-/// common with unstable Tor circuits.
 class TorOnionClient {
   final int proxyPort;
 
@@ -64,14 +55,6 @@ class TorOnionClient {
     return _send('POST', url, headers: headers, body: body);
   }
 
-  Future<TorResponse> put(String url, {Map<String, String>? headers, String? body}) async {
-    return _send('PUT', url, headers: headers, body: body);
-  }
-
-  Future<TorResponse> delete(String url, {Map<String, String>? headers}) async {
-    return _send('DELETE', url, headers: headers);
-  }
-
   Future<TorResponse> _send(String method, String url, {
     Map<String, String>? headers,
     String? body
@@ -80,13 +63,8 @@ class TorOnionClient {
     try {
       final uri = Uri.parse(url);
 
-      //
-      // 1. Connect to Local Tor Proxy
-      socket = await Socket.connect('127.0.0.1', proxyPort,
-          timeout: const Duration(seconds: 20));
+      socket = await Socket.connect('127.0.0.1', proxyPort, timeout: const Duration(seconds: 20));
 
-      // 2. Perform CONNECT Handshake
-      // We tell the proxy to open a tunnel to the onion address
       final targetPort = uri.port == 0 ? 80 : uri.port;
       final handshake = 'CONNECT ${uri.host}:$targetPort HTTP/1.1\r\n'
                         'Host: ${uri.host}:$targetPort\r\n'
@@ -95,49 +73,36 @@ class TorOnionClient {
       await socket.flush();
 
       final responseCompleter = Completer<TorResponse>();
-      final buffer = <int>[];
+      final buffer = <int>[]; // Raw byte buffer
       bool handshakeComplete = false;
 
-      // 3. Listen to the socket stream
       socket.listen((data) {
         buffer.addAll(data);
 
-        // Check for Proxy Handshake completion
         if (!handshakeComplete) {
-          // We decode loosely to check for the HTTP 200 OK from the proxy
+          // Decode loosely just to check headers
           final tempString = utf8.decode(buffer, allowMalformed: true);
 
           if (tempString.contains('\r\n\r\n')) {
             if (tempString.contains(' 200 ')) {
-              // Handshake Success!
-              // Remove the proxy response from the buffer to isolate the real response
-              final splitIdx = tempString.indexOf('\r\n\r\n') + 4;
-              // If the proxy sent extra bytes belonging to the real response, keep them
-              final leftover = buffer.sublist(splitIdx); // Logic correction depends on raw bytes, but this is usually safe for header parsing
-
+              // Clear buffer of proxy handshake garbage
               buffer.clear();
-              // In edge cases, the real response might have started arriving in the same packet
-              // but usually, we write the request first.
-
               handshakeComplete = true;
-
-              // 4. Send the Real HTTP Request through the tunnel
               _writeHttpRequest(socket!, method, uri, headers, body);
             } else {
               socket!.destroy();
               if (!responseCompleter.isCompleted) {
-                responseCompleter.completeError("Proxy Handshake Failed: $tempString");
+                responseCompleter.completeError("Proxy Handshake Failed");
               }
             }
           }
         }
       }, onDone: () {
-        // 5. Connection Closed - Process the buffer
         if (handshakeComplete && !responseCompleter.isCompleted) {
-          final fullString = utf8.decode(buffer, allowMalformed: true);
-          responseCompleter.complete(_parseRawResponse(fullString));
+          // Pass raw bytes to parser
+          responseCompleter.complete(_parseRawResponse(Uint8List.fromList(buffer)));
         } else if (!responseCompleter.isCompleted) {
-          responseCompleter.completeError("Connection closed before response received");
+          responseCompleter.completeError("Connection closed early");
         }
       }, onError: (e) {
         if (!responseCompleter.isCompleted) responseCompleter.completeError(e);
@@ -157,11 +122,11 @@ class TorOnionClient {
 
     sb.write('$method $path HTTP/1.1\r\n');
     sb.write('Host: ${uri.host}\r\n');
-    sb.write('Connection: close\r\n'); // Critical: tells server to close socket after sending data
-    sb.write('Accept-Encoding: identity\r\n'); // Critical: prevents GZIP which raw socket can't handle easily
+    sb.write('Connection: close\r\n');
+    sb.write('Accept-Encoding: identity\r\n');
 
     headers?.forEach((key, value) {
-      if (key.toLowerCase() != 'content-length') { // We calculate content-length manually
+      if (key.toLowerCase() != 'content-length') {
         sb.write('$key: $value\r\n');
       }
     });
@@ -175,7 +140,7 @@ class TorOnionClient {
       }
     }
 
-    sb.write('\r\n'); // End of headers
+    sb.write('\r\n');
     socket.write(sb.toString());
 
     if (bodyBytes != null) {
@@ -184,27 +149,42 @@ class TorOnionClient {
     socket.flush();
   }
 
-  TorResponse _parseRawResponse(String raw) {
-    if (raw.isEmpty) return TorResponse(statusCode: 500, body: "", headers: {});
+  TorResponse _parseRawResponse(Uint8List rawBytes) {
+    if (rawBytes.isEmpty) return TorResponse(statusCode: 500, body: "", bodyBytes: Uint8List(0), headers: {});
 
-    final splitIndex = raw.indexOf('\r\n\r\n');
-    if (splitIndex == -1) {
-      return TorResponse(statusCode: 500, body: raw, headers: {});
+    // Find the header/body separator (\r\n\r\n) in raw bytes
+    int splitIndex = -1;
+    for (int i = 0; i < rawBytes.length - 3; i++) {
+      if (rawBytes[i] == 13 && rawBytes[i+1] == 10 && rawBytes[i+2] == 13 && rawBytes[i+3] == 10) {
+        splitIndex = i;
+        break;
+      }
     }
 
-    final headerString = raw.substring(0, splitIndex);
-    final bodyString = raw.substring(splitIndex + 4);
+    if (splitIndex == -1) {
+      // Fallback: convert everything to string (might be error message)
+      final str = utf8.decode(rawBytes, allowMalformed: true);
+      return TorResponse(statusCode: 500, body: str, bodyBytes: rawBytes, headers: {});
+    }
 
-    // Parse Status Line
+    // Decode Headers only
+    final headerBytes = rawBytes.sublist(0, splitIndex);
+    final headerString = utf8.decode(headerBytes, allowMalformed: true);
+
+    // Body is everything after \r\n\r\n
+    final bodyBytes = rawBytes.sublist(splitIndex + 4);
+    // Lazily decode string body for JSON users, but keep bytes for file users
+    final bodyString = utf8.decode(bodyBytes, allowMalformed: true);
+
     final statusLine = headerString.split('\r\n')[0];
-    // HTTP/1.1 200 OK
     final parts = statusLine.split(' ');
     final statusCode = parts.length > 1 ? int.tryParse(parts[1]) ?? 0 : 0;
 
     return TorResponse(
       statusCode: statusCode,
-      body: bodyString,
-      headers: {}, // Parsing all headers is optional for this use case, but doable
+      body: bodyString,     // For JSON
+      bodyBytes: bodyBytes, // For Files
+      headers: {},
     );
   }
 }
@@ -212,14 +192,16 @@ class TorOnionClient {
 class TorResponse {
   final int statusCode;
   final String body;
+  final Uint8List bodyBytes; // <--- NEW: Raw binary data
   final Map<String, String> headers;
 
   TorResponse({
     required this.statusCode,
     required this.body,
+    required this.bodyBytes,
     required this.headers,
   });
 
   @override
-  String toString() => 'TorResponse($statusCode)';
+  String toString() => 'TorResponse($statusCode, bytes: ${bodyBytes.length})';
 }
